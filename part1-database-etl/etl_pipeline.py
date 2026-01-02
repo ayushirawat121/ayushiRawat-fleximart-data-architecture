@@ -1,5 +1,16 @@
 from sqlalchemy import create_engine, text
 import pandas as pd
+from sqlalchemy import text
+import os
+
+#this is for data quality report
+dq_report = {
+    "customers": {},
+    "products": {},
+    "sales": {}
+}
+
+BASE_DIRECTORY = os.path.dirname(os.path.abspath(__file__))
 
 #mysql connection sqlalchemy
 engine = create_engine("mysql+pymysql://root:Test12345678@localhost:3306/fleximart")
@@ -25,6 +36,10 @@ sales_df = pd.read_csv(
         "status": "string"
     },
     keep_default_na=False)
+
+dq_report["customers"]["records_processed"] = len(customers_df)
+dq_report["products"]["records_processed"] = len(products_df)
+dq_report["sales"]["records_processed"] = len(sales_df)
 
 #method for standardizing the phone number----
 def standardize_phone(phone):
@@ -66,8 +81,16 @@ def to_yyyy_mm_dd(date_series: pd.Series) -> pd.Series:
 # TRANSFORM: Customers Data
 # ----------------------------
 
-def transform_customer_data(customers_df : pd.DataFrame) -> pd.DataFrame :
+def transform_customer_data(customers_df : pd.DataFrame, dq_report: dict) -> pd.DataFrame :
     df = customers_df.copy()
+
+    before = len(df)
+    df = df.drop_duplicates(subset="customer_id", keep="first")
+    after = len(df)
+    dq_report["customers"]["duplicates_removed"] = before - after
+
+    missing_email = (df["email"].astype(str).str.strip() == "").sum()
+    dq_report["customers"]["missing_values_handled"] = int(missing_email)
 
     #remove the duplicate customers by using the customer id
     df = df.drop_duplicates(subset="customer_id", keep="first")
@@ -96,23 +119,31 @@ def transform_customer_data(customers_df : pd.DataFrame) -> pd.DataFrame :
 # TRANSFORM: Products Data
 # ----------------------------
 
-def transform_products_data(products_df : pd.DataFrame) -> pd.DataFrame :
-
+def transform_products_data(products_df: pd.DataFrame, dq_report: dict) -> pd.DataFrame:
     df = products_df.copy()
 
-    # Remove duplicate values by product_id
+    # --- duplicates removed ---
+    before = len(df)
     df = df.drop_duplicates(subset="product_id", keep="first")
+    after = len(df)
+    dq_report["products"]["duplicates_removed"] = int(before - after)
+
+    # --- missing values handled ---
+    # missing price count BEFORE filling with 0
+    missing_price = pd.to_numeric(df["price"], errors="coerce").isna().sum()
+    dq_report["products"]["missing_values_handled"] = int(missing_price)
 
     # Standardize category names
     df["category"] = df["category"].apply(standardize_category)
 
-    # Handle missing values in products table
-    df["price"] = pd.to_numeric(df["price"], errors="coerce")
-    df["stock_quantity"] = pd.to_numeric(df["stock_quantity"], errors="coerce").astype("Int64")
+    # Convert numeric columns + fill missing price with 0
+    df["price"] = pd.to_numeric(df["price"], errors="coerce").fillna(0)
 
-    # - stock_quantity missing -> default 0
-    # - price missing -> keep NULL
-    df["stock_quantity"] = df["stock_quantity"].fillna(0)
+    df["stock_quantity"] = (
+        pd.to_numeric(df["stock_quantity"], errors="coerce")
+        .astype("Int64")
+        .fillna(0)
+    )
 
     # Add surrogate key
     df = df.reset_index(drop=True)
@@ -124,13 +155,21 @@ def transform_products_data(products_df : pd.DataFrame) -> pd.DataFrame :
 # TRANSFORM: Sales Data
 # ----------------------------
 
-def transform_sales_data(sales_df: pd.DataFrame) -> pd.DataFrame:
+def transform_sales_data(sales_df: pd.DataFrame, dq_report: dict) -> pd.DataFrame:
     df = sales_df.copy()
 
-    # Remove duplicates by transaction_id
+    # --- duplicates removed ---
+    before = len(df)
     df = df.drop_duplicates(subset="transaction_id", keep="first")
+    after = len(df)
+    dq_report["sales"]["duplicates_removed"] = int(before - after)
 
-    # Handle missing values (customer_id/product_id empty -> NULL)
+    # --- missing values handled ---
+    missing_customer = (df["customer_id"].astype(str).str.strip() == "").sum()
+    missing_product = (df["product_id"].astype(str).str.strip() == "").sum()
+    dq_report["sales"]["missing_values_handled"] = int(missing_customer + missing_product)
+
+    # Handle missing customer_id/product_id (convert blanks -> NA)
     df["customer_id"] = df["customer_id"].replace("", pd.NA)
     df["product_id"] = df["product_id"].replace("", pd.NA)
 
@@ -147,7 +186,7 @@ def transform_sales_data(sales_df: pd.DataFrame) -> pd.DataFrame:
     # Convert transaction_date to YYYY-MM-DD
     df["transaction_date"] = to_yyyy_mm_dd(df["transaction_date"])
 
-    # Standardize status (Completed/Pending/Cancelled)
+    # Standardize status
     df["status"] = df["status"].str.strip().str.lower().str.capitalize()
 
     # Add surrogate key
@@ -156,14 +195,22 @@ def transform_sales_data(sales_df: pd.DataFrame) -> pd.DataFrame:
 
     return df
 
-if __name__ == "__main__":
-    customers_clean = transform_customer_data(customers_df)
-    products_clean = transform_products_data(products_df)
-    sales_clean = transform_sales_data(sales_df)
 
-    print(customers_clean.head())
-    print(products_clean.head())
-    print(sales_clean.head())
+if __name__ == "__main__":
+    customers_clean = transform_customer_data(customers_df, dq_report)
+    products_clean = transform_products_data(products_df, dq_report)
+    sales_clean = transform_sales_data(sales_df, dq_report)
+
+# ----------------------------
+#cleaning the data in db before performing data insertion
+# ----------------------------
+with engine.begin() as conn:
+    conn.execute(text("SET FOREIGN_KEY_CHECKS = 0"))
+    conn.execute(text("TRUNCATE TABLE order_items"))
+    conn.execute(text("TRUNCATE TABLE orders"))
+    conn.execute(text("TRUNCATE TABLE products"))
+    conn.execute(text("TRUNCATE TABLE customers"))
+    conn.execute(text("SET FOREIGN_KEY_CHECKS = 1"))
 
 
 #next is to insert the data into database
@@ -222,9 +269,6 @@ def load_products(products_clean: pd.DataFrame, engine) -> dict:
     return product_map
 
 #insert orders and orders items into database
-from sqlalchemy import text
-import pandas as pd
-
 def load_orders_and_items_mysql(sales_clean: pd.DataFrame, engine, customer_map: dict, product_map: dict) -> None:
     df = sales_clean.copy()
 
@@ -275,6 +319,21 @@ def load_orders_and_items_mysql(sales_clean: pd.DataFrame, engine, customer_map:
 
     print(f"Inserted {len(df)} orders and {len(df)} order_items")
 
+#method to generate the data quality report
+def write_data_quality_report(dq_report, filepath):
+    with open(filepath, "w", encoding="utf-8") as f:
+        f.write("DATA QUALITY REPORT\n")
+        f.write("=" * 50 + "\n\n")
+
+        for name in ["customers", "products", "sales"]:
+            f.write(f"{name.upper()} FILE\n")
+            f.write(f"Number of records processed          : {dq_report[name].get('records_processed', 0)}\n")
+            f.write(f"Number of duplicates removed         : {dq_report[name].get('duplicates_removed', 0)}\n")
+            f.write(f"Number of missing values handled     : {dq_report[name].get('missing_values_handled', 0)}\n")
+            f.write(f"Number of records loaded successfully: {dq_report[name].get('records_loaded_successfully', 0)}\n\n")
+
+    print("data_quality_report.txt generated")
+
 
 if __name__ == "__main__":
     customer_map = load_customers(customers_clean, engine)
@@ -282,6 +341,16 @@ if __name__ == "__main__":
     load_orders_and_items_mysql(sales_clean, engine, customer_map, product_map)
 
     print("Clean data inserted into MySQL successfully")
+    
+
+ #records loaded successfully
+dq_report["customers"]["records_loaded_successfully"] = len(customers_clean)
+dq_report["products"]["records_loaded_successfully"] = len(products_clean)
+dq_report["sales"]["records_loaded_successfully"] = len(sales_clean)
+
+#write the data quality report
+report_path = os.path.join(BASE_DIRECTORY, "data_quality_report.txt")
+write_data_quality_report(dq_report, report_path)
 
 
 
